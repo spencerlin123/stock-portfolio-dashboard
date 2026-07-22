@@ -346,6 +346,7 @@
     <div class="card kpi-card">
       <div class="kpi-label">vs. Market</div>
       <div class="kpi-period-tabs" id="kpi-vs-tabs">
+        <button class="kpi-period-btn" data-period="1W" onclick="setVsPeriod('1W')">1W</button>
         <button class="kpi-period-btn" data-period="MTD" onclick="setVsPeriod('MTD')">MTD</button>
         <button class="kpi-period-btn active" data-period="YTD" onclick="setVsPeriod('YTD')">YTD</button>
         <button class="kpi-period-btn" data-period="1Y" onclick="setVsPeriod('1Y')">1Y</button>
@@ -512,6 +513,8 @@
               <th style="text-align:left;cursor:default">Date</th>
               <th style="text-align:left;cursor:default">Ticker</th>
               <th style="cursor:default">Shares Sold</th>
+              <th style="cursor:default">Avg Buy Price</th>
+              <th style="cursor:default">Sell Price</th>
               <th style="cursor:default">Proceeds</th>
               <th style="cursor:default">Cost Basis</th>
               <th style="cursor:default">Gain / Loss</th>
@@ -1143,7 +1146,9 @@ function computeRealizedGains(transactions) {
       const proceeds   = sharesSold * tx.price;
       results.push({ date: tx.date, ticker, shares_sold: sharesSold,
                      proceeds, cost_basis: totalCost, gain: proceeds - totalCost,
-                     st_gain: stGain, lt_gain: ltGain });
+                     st_gain: stGain, lt_gain: ltGain,
+                     sell_price: tx.price,
+                     avg_buy_price: sharesSold > 0 ? totalCost / sharesSold : 0 });
     }
   }
   return results.sort((a, b) => b.date.localeCompare(a.date));
@@ -1194,7 +1199,7 @@ function renderRealizedGains(transactions) {
   const summary = document.getElementById('gains-summary');
   if (!gains.length) {
     if (summary) summary.innerHTML = '';
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted)">No realized sales</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted)">No realized sales</td></tr>';
     return;
   }
   const totalST = gains.reduce((s, g) => s + g.st_gain, 0);
@@ -1210,6 +1215,8 @@ function renderRealizedGains(transactions) {
     <td style="text-align:left">${g.date}</td>
     <td style="text-align:left;font-weight:600">${g.ticker}</td>
     <td>${fmt.shares(g.shares_sold)}</td>
+    <td>${fmt.usd(g.avg_buy_price)}</td>
+    <td>${fmt.usd(g.sell_price)}</td>
     <td>${fmt.usd(g.proceeds)}</td>
     <td>${fmt.usd(g.cost_basis)}</td>
     <td class="${colorClass(g.gain)}">${g.gain>=0?'+':'-'}${fmt.usd(g.gain)}</td>

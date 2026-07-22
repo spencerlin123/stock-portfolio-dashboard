@@ -311,6 +311,7 @@ def compute_period_returns(portfolio_df: pd.DataFrame, spy_df: pd.DataFrame,
     today = pd.Timestamp.today().normalize()
 
     def _period_start(label: str) -> pd.Timestamp:
+        if label == "1W":  return today - pd.DateOffset(days=7)
         if label == "MTD": return pd.Timestamp(today.year, today.month, 1)
         if label == "1M":  return today - pd.DateOffset(months=1)
         if label == "3M":  return today - pd.DateOffset(months=3)
@@ -403,7 +404,7 @@ def compute_period_returns(portfolio_df: pd.DataFrame, spy_df: pd.DataFrame,
         total_return = (1 + annualized) ** period_years - 1
         return round(total_return * 100, 2)
 
-    periods = ["MTD", "1M", "3M", "6M", "YTD", "1Y", "2Y", "3Y", "All"]
+    periods = ["1W", "MTD", "1M", "3M", "6M", "YTD", "1Y", "2Y", "3Y", "All"]
     rows = []
     for p in periods:
         start = _period_start(p)
@@ -417,90 +418,11 @@ def compute_period_returns(portfolio_df: pd.DataFrame, spy_df: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
-def _fix_historical_cash_rows(sheet, transactions_df: pd.DataFrame):
-    """
-    One-time migration: recompute CASH rows in the Historical tab using the correct
-    running-balance method (SELLs/DIVs add cash, BUYs draw it down, floor at 0).
-    Removes all existing CASH rows and replaces them with corrected values.
-    """
-    try:
-        hist_ws = sheet.worksheet("Historical")
-    except Exception:
-        return
-
-    all_vals = hist_ws.get_all_values()
-    if len(all_vals) < 2:
-        return
-
-    headers = all_vals[0]
-    non_cash = [headers]
-    old_cash_count = 0
-    equity_dates: set[str] = set()
-    for row in all_vals[1:]:
-        if len(row) > 1 and row[1] == "CASH":
-            old_cash_count += 1
-        else:
-            non_cash.append(row)
-            if row and row[0]:
-                equity_dates.add(row[0])
-
-    if old_cash_count == 0:
-        return  # Already clean — nothing to fix
-
-    # Build running cash balance from transactions
-    txn = transactions_df.copy()
-    txn["date"] = pd.to_datetime(txn["date"], errors="coerce")
-    txn["amount"] = pd.to_numeric(txn["amount"], errors="coerce").fillna(0.0)
-    txn = txn.sort_values("date").reset_index(drop=True)
-
-    running = 0.0
-    cash_by_date: dict[str, float] = {}
-    for _, row in txn.iterrows():
-        action = row.get("action", "")
-        amount = float(row.get("amount", 0.0))
-        if action in ("SELL", "DIVIDEND"):
-            running += abs(amount)
-        elif action in ("BUY", "REINVESTMENT"):
-            running = max(0.0, running - abs(amount))
-        cash_by_date[str(row["date"].date())] = running
-
-    sorted_txn_dates = sorted(cash_by_date.keys())
-
-    def _cash_on(date_str: str) -> float:
-        import bisect
-        idx = bisect.bisect_right(sorted_txn_dates, date_str) - 1
-        return cash_by_date[sorted_txn_dates[idx]] if idx >= 0 else 0.0
-
-    new_cash_rows = []
-    for d in sorted(equity_dates):
-        val = _cash_on(d)
-        if val > 0.01:
-            new_cash_rows.append([d, "CASH", 1, round(val, 2), round(val, 2)])
-
-    all_rows = non_cash + new_cash_rows
-    all_rows_sorted = [all_rows[0]] + sorted(all_rows[1:], key=lambda r: r[0])
-
-    hist_ws.clear()
-    hist_ws.update(all_rows_sorted, value_input_option="USER_ENTERED")
-    print(f"  [fix] Historical CASH rows: removed {old_cash_count} old, wrote {len(new_cash_rows)} corrected")
-
-
 def write_hidden_tabs(sheet):
     """
     Build _PortfolioHistory (daily portfolio totals) and _Benchmarks (period returns).
     Both tabs are hidden. Safe to re-run — tabs are cleared before re-writing.
     """
-
-    # ── Migrate Historical CASH rows to correct running-balance method ──────
-    # Must happen before we read Historical below, so _PortfolioHistory is built
-    # from corrected values.
-    try:
-        txn_ws = sheet.worksheet("Transactions")
-        _txn_for_migration = read_tab_as_df(txn_ws)
-        if not _txn_for_migration.empty:
-            _fix_historical_cash_rows(sheet, _txn_for_migration)
-    except Exception as _e:
-        print(f"  [fix] CASH row migration skipped: {_e}")
 
     # ── Read Historical tab ─────────────────────────────────────────────────
     try:

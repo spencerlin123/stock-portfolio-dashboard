@@ -230,11 +230,13 @@ def _fetch_all_closes(tickers: list, start_date, end_date) -> pd.DataFrame:
 
 
 def write_historical(ws, all_transactions: pd.DataFrame,
-                     no_price_tickers: set | None = None):
+                     no_price_tickers: set | None = None,
+                     current_cash: float | None = None):
     """
     Build portfolio value over time using Yahoo Finance historical close prices.
     Tickers in no_price_tickers are tracked at cost basis only (no market price).
-    Skips dates already present in the Historical tab.
+    Stock position rows: skips dates already present (avoids redundant API calls).
+    CASH rows: always rebuilt for full history so deposits are never omitted.
     """
 
     if no_price_tickers is None:
@@ -249,17 +251,38 @@ def write_historical(ws, all_transactions: pd.DataFrame,
     if "date" not in existing.columns:
         ws.clear()
         ws.append_row(_HISTORICAL_HEADERS)
-        existing_dates = set()
+        existing_stock_dates = set()
     else:
-        existing_dates = set(existing["date"].astype(str).tolist())
+        has_ticker = "ticker" in existing.columns
+        existing_non_cash = existing[existing["ticker"] != "CASH"] if has_ticker else existing
+        existing_stock_dates = set(existing_non_cash["date"].astype(str).tolist())
 
-    if existing_dates:
-        max_existing = pd.Timestamp(max(existing_dates)).date()
-        start_date = (pd.Timestamp(max_existing) - pd.Timedelta(days=5)).date()
+        # Remove stale CASH rows so they can be recomputed correctly below.
+        # Deposits added since the last import shift the running cash balance for all
+        # future dates; rebuilding from scratch ensures the history is always consistent.
+        if has_ticker and (existing["ticker"] == "CASH").any():
+            ws.clear()
+            ws.append_row(_HISTORICAL_HEADERS)
+            if not existing_non_cash.empty:
+                keeper_rows = [
+                    [str(r.get("date", ""))[:10], str(r.get("ticker", "")),
+                     r.get("shares_held", ""), r.get("close_price", ""),
+                     r.get("position_value", "")]
+                    for _, r in existing_non_cash.iterrows()
+                ]
+                ws.append_rows(keeper_rows, value_input_option="USER_ENTERED")
+
+    if existing_stock_dates:
+        max_existing = pd.Timestamp(max(existing_stock_dates)).date()
+        stock_start = (pd.Timestamp(max_existing) - pd.Timedelta(days=5)).date()
     else:
-        start_date = buys_sells["date"].min().date()
+        stock_start = buys_sells["date"].min().date()
     end_date = pd.Timestamp.today().date()
-    all_dates  = pd.date_range(start=start_date, end=end_date, freq="B")
+    stock_dates = pd.date_range(start=stock_start, end=end_date, freq="B")
+
+    # CASH rows cover full transaction history (not just the recent window)
+    history_start = buys_sells["date"].min().date()
+    all_history_dates = pd.date_range(start=history_start, end=end_date, freq="B")
 
     all_tickers      = [t for t in buys_sells["ticker"].unique() if t not in _CASH_EQUIVALENTS]
     price_tickers    = [t for t in all_tickers if t not in no_price_tickers and not _is_cusip(t)]
@@ -268,14 +291,22 @@ def write_historical(ws, all_transactions: pd.DataFrame,
     close_prices = pd.DataFrame()
     if price_tickers:
         print(f"  Fetching historical prices for {len(price_tickers)} tickers via yfinance...")
-        close_prices = _fetch_all_closes(price_tickers, start_date, end_date)
+        close_prices = _fetch_all_closes(price_tickers, stock_start, end_date)
 
     cash_by_date, sorted_dates = _build_cash_balance(all_transactions)
 
+    # Anchor the transaction-derived cash series to the actual account balance so that
+    # historical chart values are consistent with the live KPI box (which uses BROKERAGE_CASH).
+    # Deposit step-ups remain visible — only the absolute level is shifted.
+    cash_adj = 0.0
+    if current_cash is not None and sorted_dates:
+        cash_adj = current_cash - cash_by_date[sorted_dates[-1]]
+
     rows = []
-    for date in all_dates:
-        date_str    = str(date.date())
-        if date_str in existing_dates:
+    # Stock position rows — only for new dates (no redundant price fetches)
+    for date in stock_dates:
+        date_str = str(date.date())
+        if date_str in existing_stock_dates:
             continue
         txns_to_date = buys_sells[buys_sells["date"] <= date]
 
@@ -290,7 +321,6 @@ def write_historical(ws, all_transactions: pd.DataFrame,
                 continue
 
             if ticker in no_price_set:
-                # Use WAVG cost basis as position value (no market price)
                 cost_buys  = ticker_txns[ticker_txns["action"] == "BUY"]
                 total_cost = (cost_buys["shares"] * cost_buys["price"].fillna(0)).sum()
                 total_shares_bought = cost_buys["shares"].sum()
@@ -310,7 +340,10 @@ def write_historical(ws, all_transactions: pd.DataFrame,
                              round(float(close), 4),
                              round(shares * float(close), 2)])
 
-        cash_val = _cash_on(date_str, cash_by_date, sorted_dates)
+    # CASH rows — always rebuilt for full history so deposits are never omitted
+    for date in all_history_dates:
+        date_str = str(date.date())
+        cash_val = max(0.0, _cash_on(date_str, cash_by_date, sorted_dates) + cash_adj)
         if cash_val > 0.01:
             rows.append([date_str, "CASH", 1, round(cash_val, 2), round(cash_val, 2)])
 
@@ -390,7 +423,9 @@ def run_ira_pipeline(sheet, all_ira_txns: pd.DataFrame):
     write_holdings(ira_holdings_ws, all_ira_in_sheet, cash_env_var="IRA_CASH")
 
     ira_hist_ws = get_or_create_tab(sheet, "IRA_Historical", _HISTORICAL_HEADERS)
-    write_historical(ira_hist_ws, all_ira_in_sheet, no_price_tickers=_NO_PRICE_TICKERS)
+    _ira_cash = float(os.environ.get("IRA_CASH", 0) or 0)
+    write_historical(ira_hist_ws, all_ira_in_sheet, no_price_tickers=_NO_PRICE_TICKERS,
+                     current_cash=_ira_cash if _ira_cash > 0 else None)
 
     ira_divs_ws = get_or_create_tab(sheet, "IRA_Dividends", _DIVIDENDS_HEADERS)
     write_dividends(ira_divs_ws, all_ira_in_sheet)
@@ -426,7 +461,9 @@ def main():
     write_holdings(holdings_ws, all_txns_in_sheet, cash_env_var="BROKERAGE_CASH")
 
     hist_ws = get_or_create_tab(sheet, "Historical", _HISTORICAL_HEADERS)
-    write_historical(hist_ws, all_txns_in_sheet)
+    _brk_cash = float(os.environ.get("BROKERAGE_CASH", 0) or 0)
+    write_historical(hist_ws, all_txns_in_sheet,
+                     current_cash=_brk_cash if _brk_cash > 0 else None)
 
     divs_ws = get_or_create_tab(sheet, "Dividends", _DIVIDENDS_HEADERS)
     write_dividends(divs_ws, all_txns_in_sheet)

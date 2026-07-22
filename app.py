@@ -37,6 +37,7 @@ _YF_HEADERS = {
 # Sector lookup (cached 24 h)
 # ---------------------------------------------------------------------------
 _CUSIP_RE_PY = _re.compile(r'^[A-Z0-9]{8}[0-9]$')
+_NO_PRICE_TICKERS_APP: frozenset = frozenset({"PUTN_LCV"})
 
 _ETF_OVERRIDES: dict[str, str] = {
     "SPY": "ETF", "QQQ": "ETF", "IVV": "ETF", "VOO": "ETF", "VTI": "ETF",
@@ -111,6 +112,101 @@ def _fetch_sectors(tickers: list[str]) -> dict[str, str]:
     return result
 
 
+def _backfill_history_gap(
+    ph_df: pd.DataFrame,
+    holdings_records: list,
+    today_ts: pd.Timestamp,
+    txn_cash: float | None = None,
+) -> pd.DataFrame:
+    """
+    Fill any gap between the last stored _PortfolioHistory entry and yesterday by
+    computing daily portfolio values from current Holdings shares × Yahoo Finance prices.
+    Prevents short-period charts (1W, MTD) from going blank when the scheduled import
+    hasn't run recently. Results are merged without overwriting stored data.
+    """
+    import time as _t
+    from tools.format_dashboard import _fetch_closes
+
+    if ph_df.empty or not holdings_records:
+        return ph_df
+
+    non_today = ph_df[ph_df["date"] < today_ts]
+    if non_today.empty:
+        return ph_df
+
+    last_hist = non_today["date"].max().normalize()
+    yesterday = (today_ts - pd.Timedelta(days=1)).normalize()
+
+    if last_hist >= yesterday:
+        return ph_df  # already current, nothing to fill
+
+    gap_start = last_hist + pd.Timedelta(days=1)
+    gap_dates = pd.date_range(start=gap_start, end=yesterday, freq="B")
+    if gap_dates.empty:
+        return ph_df
+
+    start_str = str(gap_start.date())
+
+    # Build ticker → shares from Holdings; CASH uses txn-derived balance when available
+    ticker_shares: dict[str, float] = {}
+    static_value = 0.0  # holdings excluded from Yahoo Finance fetch (CUSIP / no-price tickers)
+    cash_value = txn_cash if txn_cash is not None else 0.0
+    for h in holdings_records:
+        ticker = str(h.get("ticker", "")).strip()
+        shares = float(h.get("shares_held", 0) or 0)
+        if ticker == "CASH" and txn_cash is None:
+            cash_value = float(h.get("current_value", 0) or 0)
+        elif (ticker
+              and ticker != "CASH"
+              and shares > 0
+              and not _CUSIP_RE_PY.match(ticker)
+              and ticker not in _NO_PRICE_TICKERS_APP):
+            ticker_shares[ticker] = shares
+        elif ticker and ticker != "CASH" and shares > 0:
+            # Can't fetch historical prices — use current value as a static estimate,
+            # same approach as CASH. Prevents a daily jump at the live/backfill boundary.
+            static_value += float(h.get("current_value", 0) or 0)
+
+    # Fetch historical closes for each ticker in the gap window
+    price_series: dict[str, pd.Series] = {}
+    for ticker in ticker_shares:
+        try:
+            closes_df = _fetch_closes(ticker, start_str)
+            if not closes_df.empty:
+                closes_df = closes_df[closes_df["date"] >= pd.Timestamp(start_str)]
+                closes_df = closes_df[closes_df["date"] <= yesterday]
+                if not closes_df.empty:
+                    price_series[ticker] = closes_df.set_index("date")["close"]
+            _t.sleep(0.15)
+        except Exception:
+            pass
+
+    # Compute daily portfolio totals for each gap business day
+    new_rows = []
+    for d in gap_dates:
+        total = cash_value + static_value  # cash and non-priceable holdings are constant
+        for ticker, shares in ticker_shares.items():
+            if ticker in price_series:
+                avail = price_series[ticker]
+                avail = avail[avail.index <= d]
+                if not avail.empty:
+                    total += shares * float(avail.iloc[-1])
+        if total > 0:
+            new_rows.append({"date": d.normalize(), "total_value": round(total, 2)})
+
+    if not new_rows:
+        return ph_df
+
+    gap_df = pd.DataFrame(new_rows)
+    # Merge: prefer stored data over backfilled estimates (ph_df first in concat)
+    extended = pd.concat([ph_df, gap_df], ignore_index=True)
+    extended = (extended.drop_duplicates(subset=["date"])
+                .sort_values("date").reset_index(drop=True))
+    print(f"  [app] backfilled {len(new_rows)} history gap days "
+          f"({start_str} → {str(yesterday.date())})")
+    return extended
+
+
 def _compute_live_returns(sheet) -> dict:
     """
     Compute period returns live for brokerage, IRA, and overall accounts.
@@ -154,8 +250,19 @@ def _compute_live_returns(sheet) -> dict:
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
         return df
 
-    def _today_val(holdings_records: list) -> float:
-        return sum(float(h.get("current_value") or 0) for h in holdings_records)
+    def _stocks_val(holdings_records: list) -> float:
+        """Sum live stock position values, excluding CASH."""
+        return sum(float(h.get("current_value") or 0)
+                   for h in holdings_records if h.get("ticker") != "CASH")
+
+    def _holdings_cash(holdings_records: list) -> float:
+        """Read cash from the Holdings CASH row — authoritative env-var value set at import time.
+        Transaction-derived cash (_txn_cash) is intentionally not used: fees, sweeps, and
+        withheld tax make it unreliable and cause the portfolio total to appear inflated."""
+        for h in holdings_records:
+            if h.get("ticker") == "CASH":
+                return float(h.get("current_value") or 0)
+        return 0.0
 
     # Read inputs from Sheets
     brk_ph   = _read_tab(sheet, "_PortfolioHistory",     _HISTORY_COLS,      _HISTORY_NUMERIC)
@@ -165,8 +272,13 @@ def _compute_live_returns(sheet) -> dict:
     brk_txns = _read_tab(sheet, "Transactions",          _TRANSACTIONS_COLS, _TRANSACTIONS_NUMERIC)
     ira_txns = _read_tab(sheet, "IRA_Transactions",      _TRANSACTIONS_COLS, _TRANSACTIONS_NUMERIC)
 
-    brk_ph_df   = _ph_df(brk_ph, _today_val(brk_h))
-    ira_ph_df   = _ph_df(ira_ph, _today_val(ira_h))
+    brk_cash  = _holdings_cash(brk_h)
+    ira_cash  = _holdings_cash(ira_h)
+    brk_today = _stocks_val(brk_h) + brk_cash
+    ira_today = _stocks_val(ira_h) + ira_cash
+
+    brk_ph_df   = _backfill_history_gap(_ph_df(brk_ph, brk_today), brk_h, today_ts, txn_cash=brk_cash)
+    ira_ph_df   = _backfill_history_gap(_ph_df(ira_ph, ira_today), ira_h, today_ts, txn_cash=ira_cash)
     brk_txns_df = _txns_df(brk_txns)
     ira_txns_df = _txns_df(ira_txns)
 
